@@ -1,0 +1,204 @@
+version: "3.7"
+
+services:
+
+  traefik:
+    image: traefik:${TRAEFIK_VERSION}
+    container_name: "traefik"
+    restart: unless-stopped
+    command:
+      - "--log.level=DEBUG"
+
+      - --certificatesresolvers.default.acme.tlschallenge=true
+      #- "--certificatesresolvers.myresolver.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory"
+      - --certificatesresolvers.default.acme.email=${LETSENCRYPT_EMAIL}
+      - --certificatesResolvers.default.acme.storage=/etc/traefik/acme/acme.json
+
+      - --accesslog=true
+      - --log.level=INFO
+      - --accesslog.fields.defaultmode=keep
+      - --accesslog.fields.headers.defaultmode=keep
+      - --metrics.prometheus=true
+
+      - --api.dashboard=true
+      #- --api.insecure=true
+
+      - --entrypoints.websecure.address=:443
+
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.endpoint=unix:///var/run/docker.sock
+      - --providers.file.directory=/external_configs
+      - --providers.file.watch=true
+    labels:
+      traefik.enable: 'true'
+      traefik.http.routers.traefik.rule: "Host(`chronogate.${DOMAIN?err}`)"
+      traefik.http.routers.traefik.service: 'api@internal'
+      traefik.http.routers.traefik.entrypoints: 'websecure'
+      traefik.http.routers.traefik.tls.certresolver: 'default'
+      traefik.http.routers.traefik.middlewares: oauth-signin,oauth-verify
+    volumes:
+      - "./traefik/acme:/etc/traefik/acme"
+      - "./traefik/conf:/external_configs"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+
+  oauth:
+    image: quay.io/pusher/oauth2_proxy:${OAUTH2_PROXY_VERSION}
+    container_name: "oauth"
+    restart: unless-stopped
+    labels:
+      traefik.enable: 'true'
+      traefik.http.middlewares.oauth-verify.forwardAuth.address: http://oauth:4180/oauth2/auth
+      traefik.http.middlewares.oauth-verify.forwardAuth.trustForwardHeader: 'true'
+      traefik.http.middlewares.oauth-verify.forwardAuth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,Set-Cookie
+      traefik.http.middlewares.oauth-signin.errors.service: oauth@docker
+      traefik.http.middlewares.oauth-signin.errors.status: '401'
+      traefik.http.middlewares.oauth-signin.errors.query: /oauth2/sign_in
+      traefik.http.routers.oauth.entrypoints: "websecure"
+      traefik.http.routers.oauth.rule: "Host(`auth.${DOMAIN?err}`) || PathPrefix(`/oauth2`)"
+      traefik.http.routers.oauth.tls.certResolver: 'default'
+      traefik.http.routers.oauth.service: oauth@docker
+      traefik.http.services.oauth.loadbalancer.server.port: '4180'
+    environment:
+      OAUTH2_PROXY_CLIENT_ID: '${OAUTH2_PROXY_CLIENT_ID?err}'
+      OAUTH2_PROXY_CLIENT_SECRET: '${OAUTH2_PROXY_CLIENT_SECRET?err}'
+      OAUTH2_PROXY_COOKIE_DOMAIN: '.${DOMAIN?err}'
+      OAUTH2_PROXY_COOKIE_REFRESH: '1h'
+      OAUTH2_PROXY_COOKIE_SECURE: 'true'
+      OAUTH2_PROXY_COOKIE_SECRET: '${OAUTH2_PROXY_COOKIE_SECRET?err}'
+      OAUTH2_PROXY_FOOTER: '-'
+      OAUTH2_PROXY_HTTP_ADDRESS: '0.0.0.0:4180'
+      OAUTH2_PROXY_PASS_BASIC_AUTH: 'false'
+      OAUTH2_PROXY_PASS_USER_HEADERS: 'true'
+      OAUTH2_PROXY_PROVIDER: 'google'
+      OAUTH2_PROXY_REVERSE_PROXY: 'true'
+      OAUTH2_PROXY_SET_AUTHORIZATION_HEADER: 'true'
+      OAUTH2_PROXY_SET_XAUTHREQUEST: 'true'
+      OAUTH2_PROXY_WHITELIST_DOMAIN: '.${DOMAIN?err}'
+      OAUTH2_PROXY_EMAIL_DOMAIN: "${DOMAIN?err}"
+      OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE: "/config/emails.txt"
+    volumes:
+      - ./oauth:/config
+
+  portainer:
+    image: portainer/portainer:${PORTAINER_VERSION}
+    container_name: "portainer"
+    restart: unless-stopped
+    labels:
+      traefik.enable: 'true'
+      traefik.http.routers.portainer.entrypoints: 'websecure'
+      traefik.http.routers.portainer.rule: "Host(`chronogate.${DOMAIN?err}`) && PathPrefix(`/portainer`)"
+
+      traefik.http.routers.portainer.middlewares: "portainer-redirectregex, portainer-replacepathregex, oauth-signin, oauth-verify"
+      traefik.http.middlewares.portainer-replacepathregex.replacepathregex.regex: "^/portainer/(.*)"
+      traefik.http.middlewares.portainer-replacepathregex.replacepathregex.replacement: "/$$1"
+      traefik.http.middlewares.portainer-redirectregex.redirectregex.regex: "^(.*)/portainer$$"
+      traefik.http.middlewares.portainer-redirectregex.redirectregex.replacement: "$$1/portainer/"
+
+      traefik.http.routers.portainer.tls.certResolver: 'default'
+      traefik.http.services.portainer.loadbalancer.server.port: '9000'
+    command: --no-auth
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./portainer-db:/data:rw
+
+
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_VERSION}
+    container_name: "prometheus"
+    restart: unless-stopped
+    labels:
+      traefik.enable: 'true'
+      traefik.http.routers.prometheus.entrypoints: 'websecure'
+      traefik.http.routers.prometheus.rule: "Host(`chronogate.${DOMAIN?err}`) && PathPrefix(`/prometheus`)"
+      traefik.http.routers.prometheus.middlewares: oauth-signin,oauth-verify
+      traefik.http.routers.prometheus.tls.certResolver: 'default'
+      traefik.http.services.prometheus.loadbalancer.server.port: '9090'
+    secrets:
+      - prometheus.yml
+    volumes:
+      - './prometheus:/data:rw'
+    user: '99:99'
+    ulimits:
+      nofile:
+        soft: 200000
+        hard: 200000
+    command: |
+        --config.file=/run/secrets/prometheus.yml
+        --web.enable-admin-api
+        --web.external-url=https://chronogate.${DOMAIN?err}/prometheus
+        --storage.tsdb.path=/data
+        --storage.tsdb.retention.time=30d
+  
+  grafana-db:
+    image: postgres:${POSTGRESQL_VERSION}
+    container_name: "grafana-db"
+    restart: unless-stopped
+    volumes:
+      - './grafana-db:/var/lib/postgresql:rw'
+    environment:
+      POSTGRES_USER: '${POSTGRESQL_USER?err}'
+      POSTGRES_DB: '${POSTGRESQL_DATABASE?err}'
+      POSTGRES_PASSWORD: '${POSTGRESQL_PASSWORD?err}'
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION}
+    container_name: "grafana"
+    restart: unless-stopped
+    depends_on:
+      - grafana-db
+    labels:
+      traefik.enable: 'true'
+      traefik.http.routers.grafana.entrypoints: 'websecure'
+      traefik.http.routers.grafana.rule: "Host(`chronogate.${DOMAIN?err}`) && PathPrefix(`/grafana`)"
+      traefik.http.routers.grafana.middlewares: oauth-signin,oauth-verify,grafana-stripprefix
+      traefik.http.middlewares.grafana-stripprefix.stripprefix.prefixes: "/grafana"
+      traefik.http.routers.grafana.tls.certResolver: 'default'
+      traefik.http.services.grafana.loadbalancer.server.port: '3000'
+    environment:
+      GF_ALERTING_EXECUTE_ALERTS: 'true'
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+      GF_ANALYTICS_REPORTING_ENABLED: 'false'
+      GF_AUTH_PROXY_ENABLED: 'true'
+      GF_AUTH_PROXY_HEADER_NAME: 'X-Auth-Request-User'
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_AUTO_SIGN_UP: 'true'
+      GF_AUTH_PROXY_HEADERS: 'Email:X-Auth-Request-Email'
+      GF_AUTH_PROXY_ENABLE_LOGIN_TOKEN: 'true'
+      GF_AUTH_DISABLE_LOGIN_FORM: 'true'
+      GF_AUTH_DISABLE_SIGNOUT_MENU: 'true'
+      GF_DATABASE_HOST: 'grafana-db:5432'
+      GF_DATABASE_NAME: 'grafana'
+      GF_DATABASE_TYPE: postgres
+      GF_DATABASE_PASSWORD: '${POSTGRESQL_PASSWORD?err}'
+      GF_DATABASE_USER: '${POSTGRESQL_USER?err}'
+      GF_EXPLORE_ENABLED: 'true'
+      # These are the plugins I use. Feel free to modify the list
+      #GF_INSTALL_PLUGINS: grafana-piechart-panel,natel-plotly-panel,grafana-clock-panel,camptocamp-prometheus-alertmanager-datasource,briangann-datatable-panel,grafana-worldmap-panel
+      GF_LOG_LEVEL: info
+      GF_LOGIN_COOKIE_NAME: grafana_cheese_cake
+      GF_SECURITY_COOKIE_SECURE: 'true'
+      GF_SECURITY_SECRET_KEY: ${GF_SECURITY_SECRET_KEY?err}
+      GF_SERVER_DOMAIN: 'chronogate.${DOMAIN?err}'
+      GF_SERVER_ENFORCE_DOMAIN: 'true'
+      GF_SERVER_ROOT_URL: "https://%(domain)s/grafana/"
+      GF_SERVER_ROUTER_LOGGING: 'true'
+      GF_SESSION_LIFE_TIME: 86400
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_USERS_AUTO_ASSIGN_ORG: 'true'
+      GF_USERS_AUTO_ASSIGN_ORG_ROLE: 'Admin'
+      # see https://github.com/grafana/grafana/issues/20096
+      GODEBUG: netdns=go
+secrets:
+  prometheus.yml:
+    file: ./prometheus.yml
+
+
